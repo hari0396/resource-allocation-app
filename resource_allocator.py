@@ -71,12 +71,7 @@ def load_data(file):
 
     return merged_df, datetime_cols
 
-# Determine input file source
-input_file = None
-if uploaded_file:
-    input_file = uploaded_file
-elif sharepoint_url:
-    input_file = get_excel_from_sharepoint(sharepoint_url)
+input_file = uploaded_file if uploaded_file else get_excel_from_sharepoint(sharepoint_url)
 
 if input_file:
     df, datetime_cols = load_data(input_file)
@@ -85,7 +80,7 @@ if input_file:
 
     with st.sidebar:
         st.header("📋 Project Details")
-        project_name = st.text_input("Project Name")
+        project_count = st.number_input("Number of Projects", min_value=1, max_value=3, value=1)
         start_date = st.date_input("Start Date")
         end_date = st.date_input("End Date")
 
@@ -104,68 +99,71 @@ if input_file:
             0 if "Execution Owner" in x else 1 if "Senior" in x else 2
         ))
 
-        st.subheader("💡 Effort Required by Role")
-        role_efforts = {}
-        for role in available_roles:
-            effort = st.number_input(f"{role}", min_value=0, step=1, value=0)
-            if effort > 0:
-                role_efforts[role] = effort
-
-    df["Assigned Hours"] = df[filtered_weeks].sum(axis=1)
-    df["Weeks"] = len(filtered_weeks)
-    df["Capacity"] = df["Weeks"] * 40
-    df["Free Hours"] = df["Capacity"] - df["Assigned Hours"]
-    df["Utilization %"] = df["Assigned Hours"] / df["Capacity"] * 100
-
-    if "suggest" not in st.session_state:
-        st.session_state.suggest = False
-    if st.sidebar.button("Suggest Resources"):
-        st.session_state.suggest = True
-
-    if st.session_state.suggest and role_efforts:
-        st.session_state.final_output = []
-
+    compare_enabled = st.checkbox("Enable Comparison")
+    if compare_enabled:
         st.markdown("### 🔍 Compare with Specific People")
         compare_role = st.selectbox("Select Role", options=available_roles)
         filtered_names = df[df['Role'] == compare_role]['Name'].dropna().unique()
         selected_name = st.selectbox("Select Name", options=sorted(filtered_names))
         if selected_name:
             compare_df = df[df["Name"] == selected_name].copy()
-            for role, effort in role_efforts.items():
-                compare_df["Anticipated Utilization %"] = (compare_df["Assigned Hours"] + effort) / compare_df["Capacity"] * 100
+            compare_df["Assigned Hours"] = compare_df[filtered_weeks].sum(axis=1)
+            compare_df["Weeks"] = len(filtered_weeks)
+            compare_df["Capacity"] = compare_df["Weeks"] * 40
+            compare_df["Free Hours"] = compare_df["Capacity"] - compare_df["Assigned Hours"]
+            compare_df["Utilization %"] = compare_df["Assigned Hours"] / compare_df["Capacity"] * 100
+            for role in available_roles:
+                effort = st.number_input(f"{role} (For Comparison Only)", min_value=0, step=1, value=0)
+                if effort > 0:
+                    compare_df["Anticipated Utilization %"] = (compare_df["Assigned Hours"] + effort) / compare_df["Capacity"] * 100
             st.dataframe(compare_df[["Name", "Cluster", "Free Hours", "Utilization %", "Anticipated Utilization %"]])
+
+    if "project_allocations" not in st.session_state:
+        st.session_state.project_allocations = [{} for _ in range(project_count)]
+
+    for i in range(project_count):
+        st.header(f"🚀 Project {i+1} Resource Suggestions")
+
+        st.subheader("💡 Effort Required by Role")
+        role_efforts = {}
+        for role in available_roles:
+            effort = st.number_input(f"Project {i+1} - {role}", min_value=0, step=1, key=f"effort_{i}_{role}")
+            if effort > 0:
+                role_efforts[role] = effort
+
+        df_copy = df.copy()
+
+        for past_project in st.session_state.project_allocations[:i]:
+            for selected_name, added_effort in past_project.items():
+                df_copy.loc[df_copy["Name"] == selected_name, filtered_weeks] += added_effort / len(filtered_weeks)
+
+        df_copy["Assigned Hours"] = df_copy[filtered_weeks].sum(axis=1)
+        df_copy["Weeks"] = len(filtered_weeks)
+        df_copy["Capacity"] = df_copy["Weeks"] * 40
+        df_copy["Free Hours"] = df_copy["Capacity"] - df_copy["Assigned Hours"]
+        df_copy["Utilization %"] = df_copy["Assigned Hours"] / df_copy["Capacity"] * 100
+
+        project_allocated = {}
 
         for role, effort in role_efforts.items():
             st.markdown(f"### 🔹 {role}")
-
-            cluster_df = df[(df["Cluster"] == selected_cluster) & (df["Role"] == role)].copy()
+            cluster_df = df_copy[(df_copy["Cluster"] == selected_cluster) & (df_copy["Role"] == role)].copy()
             cluster_df["Fit %"] = (cluster_df["Free Hours"] / effort) * 100
             cluster_df = cluster_df[cluster_df["Fit %"] >= min_fit_percent]
             cluster_df["Anticipated Utilization %"] = (cluster_df["Assigned Hours"] + effort) / cluster_df["Capacity"] * 100
             cluster_top = cluster_df.sort_values(by="Fit %", ascending=False).head(3)
 
-            other_df = df[(df["Role"] == role)].copy()
-            other_df["Fit %"] = (other_df["Free Hours"] / effort) * 100
-            other_df = other_df[other_df["Fit %"] >= min_fit_percent]
-            other_df = other_df[~other_df["Name"].isin(cluster_top["Name"])]
-            other_df["Anticipated Utilization %"] = (other_df["Assigned Hours"] + effort) / other_df["Capacity"] * 100
-            overall_top = other_df.sort_values(by="Fit %", ascending=False).head(3)
-
             if not cluster_top.empty:
-                st.markdown(f"**Top 3 in {selected_cluster}**")
+                selected_candidates = st.multiselect(
+                    f"Select resources for {role} (Project {i+1})",
+                    options=cluster_top["Name"].tolist(),
+                    default=[],
+                    key=f"select_{i}_{role}"
+                )
+                for name in selected_candidates:
+                    project_allocated[name] = project_allocated.get(name, 0) + effort
                 st.dataframe(cluster_top[["Name", "Cluster", "Free Hours", "Fit %", "Utilization %", "Anticipated Utilization %"]])
-                for r in cluster_top.itertuples(index=False):
-                    st.session_state.final_output.append(r._asdict())
             else:
                 st.warning(f"No suitable candidates found for role: {role} in {selected_cluster}.")
 
-            if not overall_top.empty:
-                st.markdown("**Top 3 Overall (All Clusters)**")
-                st.dataframe(overall_top[["Name", "Cluster", "Free Hours", "Fit %", "Utilization %", "Anticipated Utilization %"]])
-                for r in overall_top.itertuples(index=False):
-                    st.session_state.final_output.append(r._asdict())
-
-        if st.session_state.final_output:
-            df_final = pd.DataFrame(st.session_state.final_output)
-            csv = df_final.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Download Selected Suggestions", csv, f"{project_name}_{selected_cluster}_suggestions.csv")
+        st.session_state.project_allocations[i] = project_allocated
